@@ -459,6 +459,15 @@ struct Cli {
         help = t!("core_clap.private_mode").to_string(),
     )]
     private_mode: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_ENABLE_MULTICAST_DISCOVERY",
+        help = "Enable multicast peer discovery",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    enable_multicast_discovery: Option<bool>,
 }
 
 rust_i18n::i18n!("locales", fallback = "en");
@@ -778,6 +787,7 @@ impl TryFrom<&Cli> for TomlConfigLoader {
         f.disable_kcp_input = cli.disable_kcp_input.unwrap_or(f.disable_kcp_input);
         f.accept_dns = cli.accept_dns.unwrap_or(f.accept_dns);
         f.private_mode = cli.private_mode.unwrap_or(f.private_mode);
+        f.enable_multicast_discovery = cli.enable_multicast_discovery.unwrap_or(f.enable_multicast_discovery);
         cfg.set_flags(f);
 
         if !cli.exit_nodes.is_empty() {

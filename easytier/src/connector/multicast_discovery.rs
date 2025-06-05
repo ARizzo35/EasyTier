@@ -28,8 +28,8 @@ use crate::{
 
 const MULTICAST_ADDR: &str = "224.0.0.251";
 const MULTICAST_PORT: u16 = 55301; // Changed from 5353 to avoid mDNS conflicts
-const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
-const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10); // Faster discovery - every 10 seconds
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2); // Faster initial timeout
 const PEER_TTL: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,8 +108,26 @@ impl MulticastDiscoveryConnector {
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MULTICAST_PORT);
         tracing::info!(?bind_addr, "Attempting to bind multicast socket");
         
-        let socket = UdpSocket::bind(bind_addr).await
+        // Create socket with SO_REUSEADDR and SO_REUSEPORT to allow multiple instances on same machine
+        let socket2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+            .with_context(|| "Failed to create socket")?;
+        
+        socket2.set_reuse_address(true)
+            .with_context(|| "Failed to set SO_REUSEADDR")?;
+        
+        // SO_REUSEPORT is platform-specific, so we'll try to set it but continue if it fails
+        if let Err(e) = socket2.set_reuse_port(true) {
+            tracing::warn!(?e, "Failed to set SO_REUSEPORT, continuing anyway");
+        }
+        
+        socket2.bind(&bind_addr.into())
             .with_context(|| format!("Failed to bind multicast socket to {}", bind_addr))?;
+        
+        socket2.set_nonblocking(true)
+            .with_context(|| "Failed to set non-blocking")?;
+        
+        let socket = UdpSocket::from_std(socket2.into())
+            .with_context(|| "Failed to convert to tokio socket")?;
 
         tracing::info!("Successfully bound multicast socket, setting broadcast");
         socket.set_broadcast(true)
@@ -153,7 +171,7 @@ impl MulticastDiscoveryConnector {
 
     fn create_discovery_message(&self, message_type: MessageType) -> DiscoveryMessage {
         let network_identity = self.global_ctx.get_network_identity();
-        let listeners = self.global_ctx.get_running_listeners();
+        let bind_listeners = self.global_ctx.get_running_listeners();
         
         // Get the actual peer ID from peer manager if available
         let peer_id = if let Some(peer_mgr_weak) = &self.peer_manager {
@@ -168,11 +186,16 @@ impl MulticastDiscoveryConnector {
             rand::random()
         };
         
+        // Convert wildcard listeners to connectable addresses
+        let connectable_listeners = self.create_connectable_listeners(&bind_listeners);
+        
         tracing::debug!(
             ?peer_id,
             ?message_type,
-            listeners_count = listeners.len(),
+            bind_listeners_count = bind_listeners.len(),
+            connectable_listeners_count = connectable_listeners.len(),
             network_name = %network_identity.network_name,
+            connectable_listeners = ?connectable_listeners,
             "Creating discovery message"
         );
         
@@ -181,7 +204,7 @@ impl MulticastDiscoveryConnector {
             peer_id,
             network_name: network_identity.network_name,
             network_secret_digest: network_identity.network_secret_digest,
-            listeners: listeners.iter().map(|u| u.to_string()).collect(),
+            listeners: connectable_listeners,
             hostname: self.global_ctx.get_hostname(),
             instance_id: self.global_ctx.get_id().to_string(),
             version: crate::common::constants::EASYTIER_VERSION.to_string(),
@@ -190,6 +213,83 @@ impl MulticastDiscoveryConnector {
                 .unwrap()
                 .as_secs(),
         }
+    }
+
+    fn create_connectable_listeners(&self, bind_listeners: &[Url]) -> Vec<String> {
+        let ip_collector = self.global_ctx.get_ip_collector();
+        let ips = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(ip_collector.collect_ip_addrs())
+        });
+        
+        let mut connectable_listeners = Vec::new();
+        
+        for bind_listener in bind_listeners {
+            // Skip ring:// listeners as they use UUIDs, not IP addresses
+            if bind_listener.scheme() == "ring" {
+                connectable_listeners.push(bind_listener.to_string());
+                continue;
+            }
+            
+            if let Some(host_str) = bind_listener.host_str() {
+                let port = bind_listener.port();
+                
+                if host_str == "0.0.0.0" {
+                    // Replace with all IPv4 interface addresses
+                    for ipv4 in &ips.interface_ipv4s {
+                        let ipv4_str = ipv4.to_string();
+                        let new_url = if bind_listener.path().is_empty() || bind_listener.path() == "/" {
+                            format!("{}://{}:{}", 
+                                bind_listener.scheme(),
+                                ipv4_str,
+                                port.unwrap_or(80)
+                            )
+                        } else {
+                            format!("{}://{}:{}{}", 
+                                bind_listener.scheme(),
+                                ipv4_str,
+                                port.unwrap_or(80),
+                                bind_listener.path()
+                            )
+                        };
+                        connectable_listeners.push(new_url);
+                    }
+                } else if host_str == "::" {
+                    // Replace with all IPv6 interface addresses
+                    for ipv6 in &ips.interface_ipv6s {
+                        let ipv6_str = ipv6.to_string();
+                        let new_url = if bind_listener.path().is_empty() || bind_listener.path() == "/" {
+                            format!("{}://[{}]:{}", 
+                                bind_listener.scheme(),
+                                ipv6_str,
+                                port.unwrap_or(80)
+                            )
+                        } else {
+                            format!("{}://[{}]:{}{}", 
+                                bind_listener.scheme(),
+                                ipv6_str,
+                                port.unwrap_or(80),
+                                bind_listener.path()
+                            )
+                        };
+                        connectable_listeners.push(new_url);
+                    }
+                } else {
+                    // Keep as-is for specific addresses
+                    connectable_listeners.push(bind_listener.to_string());
+                }
+            } else {
+                // Keep as-is for non-IP listeners
+                connectable_listeners.push(bind_listener.to_string());
+            }
+        }
+        
+        tracing::debug!(
+            original_count = bind_listeners.len(),
+            connectable_count = connectable_listeners.len(),
+            "Converted bind listeners to connectable listeners"
+        );
+        
+        connectable_listeners
     }
 
     async fn send_discovery_message(&self, message: &DiscoveryMessage) -> Result<(), Error> {
@@ -310,9 +410,14 @@ impl MulticastDiscoveryConnector {
 
         // Notify about new peer
         if let Some(tx) = &self.peer_tx {
+            tracing::debug!("Sending discovered peer to handler channel");
             if let Err(_) = tx.send(discovered_peer) {
                 tracing::warn!("Failed to send discovered peer to handler");
+            } else {
+                tracing::debug!("Successfully sent discovered peer to handler");
             }
+        } else {
+            tracing::warn!("No peer_tx channel available to send discovered peer");
         }
 
         // Respond to queries
@@ -440,8 +545,8 @@ impl Clone for MulticastDiscoveryConnector {
             peer_manager: self.peer_manager.clone(),
             discovered_peers: self.discovered_peers.clone(),
             socket: self.socket.clone(),
-            shutdown_tx: None, // Don't clone shutdown channel
-            peer_tx: None,     // Don't clone peer channel
+            shutdown_tx: self.shutdown_tx.clone(),
+            peer_tx: self.peer_tx.clone(),
         }
     }
 }
@@ -558,7 +663,36 @@ mod tests {
         assert!(connector.socket.is_none());
         assert_eq!(
             connector.remote_url().to_string(),
-            "multicast://224.0.0.251:5353"
+            "multicast://224.0.0.251:55301"
         );
+    }
+
+    #[tokio::test]
+    async fn test_connectable_listeners_conversion() {
+        let global_ctx = get_mock_global_ctx();
+        let connector = MulticastDiscoveryConnector::new(global_ctx);
+        
+        // Test wildcard address conversion
+        let bind_listeners = vec![
+            "tcp://0.0.0.0:11010".parse().unwrap(),
+            "udp://[::]:11010".parse().unwrap(),
+            "tcp://192.168.1.100:11010".parse().unwrap(),
+            "ring://some-uuid".parse().unwrap(),
+        ];
+        
+        let connectable = connector.create_connectable_listeners(&bind_listeners);
+        
+        // Should have more connectable listeners than bind listeners due to wildcard expansion
+        assert!(connectable.len() >= bind_listeners.len());
+        
+        // Should not contain wildcard addresses
+        assert!(!connectable.iter().any(|url| url.contains("0.0.0.0")));
+        assert!(!connectable.iter().any(|url| url.contains("[::]")));
+        
+        // Should contain the specific address unchanged
+        assert!(connectable.iter().any(|url| url.contains("192.168.1.100:11010")));
+        
+        // Should contain the ring URL unchanged
+        assert!(connectable.iter().any(|url| url.starts_with("ring://")));
     }
 }

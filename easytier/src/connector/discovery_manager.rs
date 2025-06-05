@@ -81,11 +81,29 @@ impl DiscoveryManager {
                 hostname = %discovered_peer.hostname,
                 listeners_count = discovered_peer.listeners.len(),
                 listeners = ?discovered_peer.listeners,
-                "Discovered new peer via multicast"
+                "Received discovered peer in handler - attempting connection"
             );
 
+            // Sort listeners to prioritize TCP over ring for remote peer connections
+            let mut sorted_listeners = discovered_peer.listeners.clone();
+            sorted_listeners.sort_by(|a, b| {
+                let a_scheme = a.scheme();
+                let b_scheme = b.scheme();
+                match (a_scheme, b_scheme) {
+                    ("tcp", "ring") => std::cmp::Ordering::Less,  // TCP comes before ring
+                    ("ring", "tcp") => std::cmp::Ordering::Greater, // ring comes after TCP
+                    _ => std::cmp::Ordering::Equal,
+                }
+            });
+
             // Try to connect to the discovered peer using the manual connector manager
-            for listener_url in &discovered_peer.listeners {
+            for listener_url in &sorted_listeners {
+                // Skip ring:// URLs for remote peer connections - they are meant for local connections
+                if listener_url.scheme() == "ring" {
+                    tracing::debug!(?listener_url, "Skipping ring:// URL for remote peer connection");
+                    continue;
+                }
+
                 // Skip if we already have a connector for this URL
                 let url_string = listener_url.to_string();
                 if manual_mgr
@@ -137,7 +155,13 @@ impl DiscoveryManager {
             }
 
             // Also try to connect directly for immediate connection
-            for listener_url in &discovered_peer.listeners {
+            for listener_url in &sorted_listeners {
+                // Skip ring:// URLs for remote peer connections - they are meant for local connections
+                if listener_url.scheme() == "ring" {
+                    tracing::debug!(?listener_url, "Skipping ring:// URL for direct connection to remote peer");
+                    continue;
+                }
+
                 let url_string = listener_url.to_string();
                 
                 let is_self_direct = Self::is_our_listener(&url_string, &global_ctx);
