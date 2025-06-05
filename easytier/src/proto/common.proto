@@ -35,6 +35,8 @@ message FlagsInConfig {
   bool accept_dns = 22;
   // enable private mode
   bool private_mode = 23;
+  // enable multicast peer discovery
+  bool enable_multicast_discovery = 24;
 }
 
 message RpcDescriptor {

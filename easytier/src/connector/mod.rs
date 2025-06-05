@@ -23,6 +23,8 @@ pub mod udp_hole_punch;
 
 pub mod dns_connector;
 pub mod http_connector;
+pub mod multicast_discovery;
+pub mod discovery_manager;
 
 async fn set_bind_addr_for_peer_connector(
     connector: &mut (impl TunnelConnector + ?Sized),
@@ -148,6 +150,10 @@ pub async fn create_connector_by_url(
         }
         "txt" | "srv" => {
             let connector = dns_connector::DNSTunnelConnector::new(url, global_ctx.clone());
+            Box::new(connector)
+        }
+        "multicast" => {
+            let connector = multicast_discovery::MulticastDiscoveryConnector::new(global_ctx.clone());
             Box::new(connector)
         }
         _ => {

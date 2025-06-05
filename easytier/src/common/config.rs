@@ -38,6 +38,7 @@ pub fn gen_default_flags() -> Flags {
         disable_relay_kcp: true,
         accept_dns: false,
         private_mode: false,
+        enable_multicast_discovery: true,
     }
 }
 

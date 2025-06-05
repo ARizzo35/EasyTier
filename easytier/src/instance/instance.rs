@@ -166,6 +166,7 @@ pub struct Instance {
     peer_manager: Arc<PeerManager>,
     listener_manager: Arc<Mutex<ListenerManager<PeerManager>>>,
     conn_manager: Arc<ManualConnectorManager>,
+    discovery_manager: Option<Arc<Mutex<crate::connector::discovery_manager::DiscoveryManager>>>,
     direct_conn_manager: Arc<DirectConnectorManager>,
     udp_hole_puncher: Arc<Mutex<UdpHolePunchConnector>>,
 
@@ -215,6 +216,18 @@ impl Instance {
             peer_manager.clone(),
         ));
 
+        let discovery_manager = if global_ctx.config.get_flags().enable_multicast_discovery {
+            Some(Arc::new(Mutex::new(
+                crate::connector::discovery_manager::DiscoveryManager::new(
+                    global_ctx.clone(),
+                    peer_manager.clone(),
+                    conn_manager.clone(),
+                )
+            )))
+        } else {
+            None
+        };
+
         let mut direct_conn_manager =
             DirectConnectorManager::new(global_ctx.clone(), peer_manager.clone());
         direct_conn_manager.run();
@@ -247,6 +260,7 @@ impl Instance {
             peer_manager,
             listener_manager,
             conn_manager,
+            discovery_manager,
             direct_conn_manager: Arc::new(direct_conn_manager),
             udp_hole_puncher: Arc::new(Mutex::new(udp_hole_puncher)),
 
@@ -514,6 +528,15 @@ impl Instance {
             .get_route()
             .set_route_cost_fn(route_calc)
             .await;
+
+        // Start multicast discovery if enabled
+        if let Some(discovery_manager) = &self.discovery_manager {
+            if let Err(e) = discovery_manager.lock().await.start().await {
+                tracing::warn!("Failed to start discovery manager: {:?}", e);
+            } else {
+                tracing::info!("Multicast discovery started successfully");
+            }
+        }
 
         self.add_initial_peers().await?;
 
