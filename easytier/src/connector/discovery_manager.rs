@@ -99,23 +99,39 @@ impl DiscoveryManager {
                 }
 
                 // Check if this would connect to ourselves
-                if Self::is_our_listener(&url_string, &global_ctx) {
-                    tracing::debug!(?listener_url, "Skipping self-connection");
+                let is_self = Self::is_our_listener(&url_string, &global_ctx);
+                if is_self {
+                    tracing::debug!(
+                        ?listener_url, 
+                        our_listeners = ?global_ctx.get_running_listeners(),
+                        "Skipping self-connection"
+                    );
                     continue;
                 }
 
                 // Add the discovered peer as a connector
+                tracing::debug!(
+                    peer_id = discovered_peer.peer_id,
+                    ?listener_url,
+                    "Attempting to add discovered peer as connector"
+                );
+                
                 match manual_mgr.add_connector_by_url(&url_string).await {
                     Ok(()) => {
                         tracing::info!(
-                            ?discovered_peer.peer_id,
+                            peer_id = discovered_peer.peer_id,
                             ?listener_url,
-                            "Added discovered peer as connector"
+                            "Successfully added discovered peer as connector"
                         );
                         break; // Successfully added one listener, no need to try others
                     }
                     Err(e) => {
-                        tracing::debug!(?e, ?listener_url, "Failed to add discovered peer as connector");
+                        tracing::warn!(
+                            ?e, 
+                            peer_id = discovered_peer.peer_id,
+                            ?listener_url, 
+                            "Failed to add discovered peer as connector"
+                        );
                     }
                 }
             }
@@ -124,36 +140,66 @@ impl DiscoveryManager {
             for listener_url in &discovered_peer.listeners {
                 let url_string = listener_url.to_string();
                 
-                if Self::is_our_listener(&url_string, &global_ctx) {
+                let is_self_direct = Self::is_our_listener(&url_string, &global_ctx);
+                if is_self_direct {
+                    tracing::debug!(
+                        ?listener_url,
+                        "Skipping direct connection to self"
+                    );
                     continue;
                 }
 
+                tracing::debug!(
+                    peer_id = discovered_peer.peer_id,
+                    ?listener_url,
+                    "Attempting direct connection to discovered peer"
+                );
+                
                 match super::create_connector_by_url(
                     &url_string,
                     &global_ctx,
                     crate::tunnel::IpVersion::Both,
                 ).await {
-                    Ok(mut connector) => {
+                    Ok(connector) => {
                         let peer_mgr_clone = peer_mgr.clone();
+                        let discovered_peer_id = discovered_peer.peer_id;
+                        let url_for_log = url_string.clone();
+                        
                         tokio::spawn(async move {
+                            tracing::debug!(
+                                peer_id = discovered_peer_id,
+                                url = %url_for_log,
+                                "Starting direct connection attempt"
+                            );
+                            
                             match peer_mgr_clone.try_direct_connect(connector).await {
                                 Ok((peer_id, conn_id)) => {
                                     tracing::info!(
                                         ?peer_id,
                                         ?conn_id,
-                                        ?url_string,
-                                        "Successfully connected to discovered peer"
+                                        url = %url_for_log,
+                                        "Successfully connected to discovered peer via direct connection"
                                     );
                                 }
                                 Err(e) => {
-                                    tracing::debug!(?e, ?url_string, "Failed to connect to discovered peer");
+                                    tracing::warn!(
+                                        ?e, 
+                                        peer_id = discovered_peer_id,
+                                        url = %url_for_log, 
+                                        "Failed to connect to discovered peer via direct connection"
+                                    );
                                 }
                             }
                         });
                         break; // Try only one listener for immediate connection
                     }
                     Err(e) => {
-                        tracing::debug!(?e, ?listener_url, "Failed to create connector for discovered peer");
+                        tracing::warn!(
+                            ?e, 
+                            peer_id = discovered_peer.peer_id,
+                            ?listener_url, 
+                            "Failed to create connector for discovered peer"
+                        );
                     }
                 }
             }
@@ -163,18 +209,60 @@ impl DiscoveryManager {
 
     fn is_our_listener(url_string: &str, global_ctx: &ArcGlobalCtx) -> bool {
         let our_listeners = global_ctx.get_running_listeners();
-        our_listeners.iter().any(|our_url| {
-            // Check if the URL matches any of our listeners
-            // This is a simple string comparison, but could be made more sophisticated
-            our_url.to_string() == url_string ||
-            // Also check if it's the same host:port but different scheme
-            Self::same_host_port(our_url, url_string)
-        })
+        let is_self = our_listeners.iter().any(|our_url| {
+            let exact_match = our_url.to_string() == url_string;
+            let same_endpoint = Self::same_host_port(our_url, url_string);
+            
+            tracing::trace!(
+                our_url = %our_url,
+                their_url = %url_string,
+                exact_match = exact_match,
+                same_endpoint = same_endpoint,
+                "Checking if URL is our listener"
+            );
+            
+            exact_match || same_endpoint
+        });
+        
+        tracing::debug!(
+            their_url = %url_string,
+            our_listeners = ?our_listeners,
+            is_self = is_self,
+            "Listener self-check result"
+        );
+        
+        is_self
     }
 
     fn same_host_port(our_url: &url::Url, other_url: &str) -> bool {
         if let Ok(other_parsed) = url::Url::parse(other_url) {
-            our_url.host() == other_parsed.host() && our_url.port() == other_parsed.port()
+            let ports_match = our_url.port() == other_parsed.port();
+            
+            // Check for exact host match first
+            if our_url.host() == other_parsed.host() && ports_match {
+                return true;
+            }
+            
+            // Check if our listener is 0.0.0.0 (bind all) and ports match
+            // This is a common case where we bind to 0.0.0.0 but advertise specific IPs
+            if let (Some(our_host), Some(their_host)) = (our_url.host_str(), other_parsed.host_str()) {
+                if (our_host == "0.0.0.0" || our_host == "[::]") && ports_match {
+                    // Our listener binds to all interfaces, so any specific IP on same port
+                    // could potentially be our own listener advertised with a specific IP
+                    // But we need to be more careful here - only match if it's actually us
+                    tracing::trace!(
+                        our_host = our_host,
+                        their_host = their_host,
+                        our_port = ?our_url.port(),
+                        their_port = ?other_parsed.port(),
+                        "Checking wildcard listener against specific host"
+                    );
+                    // For now, let's be conservative and not match wildcard binds
+                    return false;
+                }
+            }
+            
+            false
         } else {
             false
         }
