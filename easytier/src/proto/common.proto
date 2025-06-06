@@ -37,6 +37,8 @@ message FlagsInConfig {
   bool private_mode = 23;
   // enable multicast peer discovery
   bool enable_multicast_discovery = 24;
+  // specify interfaces for multicast discovery: "*" for all, or comma-separated interface names with wildcard support (e.g., "eth*,wlan0")
+  string multicast_discovery_interfaces = 25;
 }
 
 message RpcDescriptor {

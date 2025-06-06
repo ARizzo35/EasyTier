@@ -39,6 +39,7 @@ pub fn gen_default_flags() -> Flags {
         accept_dns: false,
         private_mode: false,
         enable_multicast_discovery: true,
+        multicast_discovery_interfaces: "*".to_string(),
     }
 }
 
